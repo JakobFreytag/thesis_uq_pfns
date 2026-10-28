@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Generated outputs: figures, result CSVs and fit caches are rebuilt by the scripts
+results/artifacts/
+*.npz
+*.png
+*.pdf
+
+# Exception: the raw TabPFN rollouts behind the quasi-martingale diagnostics (Sec. 4.1)
+# are expensive to regenerate and are the input of tabpfn_diagnostics.ipynb, so they stay tracked.
+!results/tabpfn_diagnostics_rollouts/
+!results/tabpfn_diagnostics_rollouts/*.csv

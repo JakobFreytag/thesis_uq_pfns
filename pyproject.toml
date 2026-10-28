@@ -1,0 +1,22 @@
+[project]
+name = "uq-tabpfn"
+version = "1.0.0"
+description = "Code for the Master's thesis 'Uncertainty Quantification for Prior-Data Fitted Networks'"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib==3.10.8",
+    "numpy==1.26.4",
+    "pandas==2.3.3",
+    "pyvinecopulib==0.7.0",
+    "scikit-learn==1.6.1",
+    "scipy==1.12.0",
+    "statsmodels==0.14.4",
+    "tabpfn==2.0.5",
+    "torch==2.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel==7.4.0",
+]
