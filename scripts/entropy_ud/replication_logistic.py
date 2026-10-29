@@ -25,21 +25,17 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
-from scripts.common import RunCache, add_run_args, parse_rep_key, quiet_warnings, rep_key, seed_all, set_threads  # noqa: E402,E501
-from scripts.entropy_ud.entropy_utils import METHODS, N_ESTIMATORS, decompose, gn_vn, permuted_trajectory  # noqa: E402,E501
+from scripts.common import (  # noqa: E402
+    RunCache, add_n_estimators_arg, add_run_args, add_seed_arg, parse_rep_key, quiet_warnings, rep_key, seed_all,
+    set_threads,
+)
+from scripts.entropy_ud.entropy_utils import (  # noqa: E402
+    METHODS, N_ESTIMATORS_THESIS, decompose, gn_vn, permuted_trajectory,
+)
 
 quiet_warnings()
 
-SEED = 2026
-SIZES = (15, 50, 75, 150)
-GRID = (-15.0, 15.0, 0.2)           # test grid: lo, hi, step
 CACHE_VERSION = 2
-
-# DGP (Fortini et al. 2026b, App. L.2.1)
-X_MEAN = 1.5
-X_SD = 3.0
-BETA = 0.25
-BETA0 = -0.5
 
 METHOD_LABELS = {
     "beta": "Beta",
@@ -56,27 +52,39 @@ FS_LEGEND = 10
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Entropic UD on the 1D logistic DGP (Fortini et al. Fig. 25).")
     add_run_args(parser)
+    parser.add_argument("--n-train-list", type=int, nargs="+", default=[15, 50, 75, 150],
+                        help="sample sizes n, one dataset each (default: %(default)s)")
+    add_seed_arg(parser, 2026)
+    parser.add_argument("--grid", type=float, nargs=3, default=[-15.0, 15.0, 0.2], metavar=("LO", "HI", "STEP"),
+                        help="test grid of x* (default: %(default)s)")
+    # DGP (Fortini et al. 2026b, App. L.2.1)
+    parser.add_argument("--x-mean", type=float, default=1.5, help="mean of x (default: %(default)s)")
+    parser.add_argument("--x-sd", type=float, default=3.0, help="sd of x (default: %(default)s)")
+    parser.add_argument("--beta", type=float, default=0.25, help="slope of the logit (default: %(default)s)")
+    parser.add_argument("--beta0", type=float, default=-0.5, help="intercept of the logit (default: %(default)s)")
+    add_n_estimators_arg(parser, N_ESTIMATORS_THESIS)
     return parser.parse_args()
 
 
-def _make_data(n: int, seed: int) -> dict:
+def _make_data(args, n: int) -> dict:
     """
-    x_i ~ N(1.5, 3.0^2),  p_i = sigma(BETA * x_i + BETA0),  y_i ~ Bernoulli(p_i).
+    x_i ~ N(x_mean, x_sd^2),  p_i = sigma(beta * x_i + beta0),  y_i ~ Bernoulli(p_i).
     """
-    rng = np.random.default_rng(seed)
-    x = rng.normal(X_MEAN, X_SD, size=n)
-    p = 1.0 / (1.0 + np.exp(-(BETA * x + BETA0)))
+    rng = np.random.default_rng(args.seed)          # one dataset per n at a fixed seed, as in the paper
+    x = rng.normal(args.x_mean, args.x_sd, size=n)
+    p = 1.0 / (1.0 + np.exp(-(args.beta * x + args.beta0)))
     y = (rng.random(n) < p).astype(int)
     return {"x_train": x.reshape(-1, 1), "y_train": y, "p_train": p}
 
 
 def _cache(args) -> RunCache:
-    config = {"seed": SEED, "n_estimators": N_ESTIMATORS, "grid": list(GRID)}
+    config = {"seed": args.seed, "n_estimators": args.n_estimators, "grid": list(args.grid),
+              "x_mean": args.x_mean, "x_sd": args.x_sd, "beta": args.beta, "beta0": args.beta0}
     return RunCache(args.outdir / "replication_logistic", config, version=CACHE_VERSION)
 
 
-def _x_eval() -> np.ndarray:
-    lo, hi, step = GRID
+def _x_eval(grid) -> np.ndarray:
+    lo, hi, step = grid
     return np.linspace(lo, hi, int(round((hi - lo) / step)) + 1)
 
 
@@ -84,17 +92,18 @@ def run_fit(args) -> None:
     from uqpfn import tabpfn
 
     set_threads(args.threads)
-    seed_all(SEED)
+    seed_all(args.seed)
     cache = _cache(args)
     cache.prepare(args.overwrite)
-    todo = [n for n in SIZES if not cache.has(rep_key(n, 0))]
+    todo = [n for n in args.n_train_list if not cache.has(rep_key(n, 0))]
     print(f"[fit] {len(todo)} datasets to do in {cache.folder}")
-    model = tabpfn.make_classifier(n_estimators=N_ESTIMATORS) if todo else None
+    model = tabpfn.make_classifier(n_estimators=args.n_estimators) if todo else None
     for n in todo:
         t0 = time.time()
-        data = _make_data(n, seed=SEED)                 # one dataset per n at a fixed seed, as in the paper
-        rng = np.random.default_rng(SEED + 7919 * n)
-        traj = permuted_trajectory(data["x_train"], data["y_train"], _x_eval().reshape(-1, 1), model=model, rng=rng)
+        data = _make_data(args, n)
+        rng = np.random.default_rng(args.seed + 7919 * n)
+        traj = permuted_trajectory(data["x_train"], data["y_train"], _x_eval(args.grid).reshape(-1, 1), model=model,
+                                   n_estimators=args.n_estimators, rng=rng)
         cache.save(rep_key(n, 0), x_train=data["x_train"], y_train=data["y_train"], traj=traj)
         print(f"[fit] n={n}: {time.time() - t0:.0f}s", flush=True)
 
@@ -176,7 +185,7 @@ def run_plot(args) -> None:
         n = parse_rep_key(key)[0]
         z = cache.load(key)
         g_n, v_n = gn_vn(z["traj"], n)
-        results.append({"n": n, "x_eval": _x_eval(), "x_train": z["x_train"], "y_train": z["y_train"],
+        results.append({"n": n, "x_eval": _x_eval(args.grid), "x_train": z["x_train"], "y_train": z["y_train"],
                         "dec": {m: decompose(g_n, v_n, n, m) for m in METHODS}})
     results.sort(key=lambda r: r["n"])
     path = cache.folder / "grid.png"

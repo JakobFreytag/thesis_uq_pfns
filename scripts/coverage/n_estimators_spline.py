@@ -27,17 +27,17 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
 from scripts.common import (  # noqa: E402
-    RunCache, add_run_args, add_sample_args, add_style_args, fixed_axes_figure, n_estimators,
-    panel_geometry, parse_rep_key, quiet_warnings, rep_key, save_fig, se, seed_all, set_threads, setup_style,
+    RunCache, add_run_args, add_sample_args, add_seed_arg, add_style_args, ci_label, fixed_axes_figure,
+    n_estimators, panel_geometry, parse_rep_key, quiet_warnings, rep_key, save_fig, se, seed_all, set_threads,
+    setup_style,
 )
-from scripts.coverage.coverage_utils import TARGETS, invert_cdf, make_spline_data  # noqa: E402
+from scripts.coverage.coverage_utils import (  # noqa: E402
+    TARGETS, add_spline_args, invert_cdf, make_spline_data, spline_settings,
+)
 from uqpfn import asymptotic  # noqa: E402
 
 quiet_warnings()
 
-SEED = 2026
-N_EVAL = 100
-ALPHA = 0.10                        # 90% intervals
 PANELS_PER_ROW = 3
 LEGEND_SPACE = 0.30
 CACHE_VERSION = 2
@@ -50,7 +50,13 @@ def parse_args() -> argparse.Namespace:
     add_run_args(parser)
     add_sample_args(parser, n_list=(200,), n_reps=10)
     parser.add_argument("--n-estimators-list", type=int, nargs="+",
-                        default=sorted({n_estimators(e) for e in (4, 8, 16, 32, 64)}))
+                        default=sorted({n_estimators(e) for e in (4, 8, 16, 32, 64)}),
+                        help="TabPFN ensemble sizes (default: %(default)s)")
+    add_seed_arg(parser, 2026)
+    parser.add_argument("--n-eval", type=int, default=100, help="evaluation points on [-2.5, 2.5] (default: %(default)s)")
+    add_spline_args(parser)
+    parser.add_argument("--alpha", type=float, default=0.10,
+                        help="intervals at level 1 - alpha, applied in the plot step (default: %(default)s)")
     parser.add_argument("--plot-n", type=int, default=200, help="sample size shown in the figures")
     add_style_args(parser)
     return parser.parse_args()
@@ -108,20 +114,22 @@ def _save_row_plot(
 
 
 def _cache(args) -> RunCache:
-    return RunCache(args.outdir / "n_estimators_spline", {"seed": SEED, "n_eval": N_EVAL}, version=CACHE_VERSION)
+    config = {"seed": args.seed, "n_eval": args.n_eval, "spline": spline_settings(args)}
+    return RunCache(args.outdir / "n_estimators_spline", config, version=CACHE_VERSION)
 
 
 def _key(n: int, rep: int, n_est: int) -> str:
     return rep_key(n, rep, f"_est{n_est:03d}")
 
 
-def _fit_one(n: int, rep: int, n_est: int) -> dict:
+def _fit_one(args, n: int, rep: int, n_est: int) -> dict:
     """The CLT V_n part of one balanced spline.py repetition, with the given n_estimators."""
     from uqpfn import tabpfn
 
-    current_seed = SEED + rep * 99
+    current_seed = args.seed + rep * 99
     seed_all(current_seed)
-    data = make_spline_data(mode="balanced", seed=current_seed, n_train=n, n_eval=N_EVAL)
+    data = make_spline_data(mode="balanced", seed=current_seed, n_train=n, n_eval=args.n_eval,
+                            **spline_settings(args))
 
     shuffle_idx = np.random.permutation(n)          # the same permutation for every n_estimators
     pred_trajectory = tabpfn.build_predictive_trajectory(
@@ -145,15 +153,15 @@ def run_fit(args) -> None:
     print(f"[fit] {len(todo)} runs to do in {cache.folder}")
     for i, (n, rep, e) in enumerate(todo, 1):
         t0 = time.perf_counter()
-        cache.save(_key(n, rep, e), **_fit_one(n, rep, e))
+        cache.save(_key(n, rep, e), **_fit_one(args, n, rep, e))
         print(f"[fit {i}/{len(todo)}] n={n} rep={rep} n_estimators={e}: {time.perf_counter() - t0:.0f}s", flush=True)
 
 
-def _intervals(z: dict, target: str) -> dict:
+def _intervals(z: dict, target: str, alpha: float) -> dict:
     """CLT V_n interval for the q-quantile of y | x: pointwise CDF bounds, inverted at q."""
     q = np.array([TARGETS[target]])
     lower_cdf, upper_cdf = asymptotic.pointwise_cdf_bounds(z["final_cdf"], z["vn_variance"], int(z["n_train"]),
-                                                           alpha=ALPHA)
+                                                           alpha=alpha)
     lo = invert_cdf(z["y_grid"], upper_cdf, q)[0]
     hi = invert_cdf(z["y_grid"], lower_cdf, q)[0]
     med = invert_cdf(z["y_grid"], z["final_cdf"], q)[0]
@@ -169,7 +177,7 @@ def run_plot(args) -> None:
         n_est = int(est_s[4:])
         z = cache.load(key)
         for t in TARGETS:
-            e = _intervals(z, t)
+            e = _intervals(z, t, args.alpha)
             acc = metrics.setdefault((n, t, n_est), {"cov": [], "len": []})
             acc["cov"].append(float(np.mean(e["cov"])))
             acc["len"].append(float(np.mean(e["len"])))
@@ -177,7 +185,7 @@ def run_plot(args) -> None:
                 example[n_est] = (z, e)
 
     path = cache.folder / "coverage.csv"
-    print("Balanced spline DGP, CLT V_n, 90% intervals")
+    print(f"Balanced spline DGP, CLT V_n, {ci_label(args.alpha).removesuffix(' CI')} intervals")
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["n", "target", "n_estimators", "coverage", "se_coverage", "width", "n_reps"])
@@ -193,7 +201,6 @@ def run_plot(args) -> None:
         return
     plt = setup_style(args.font_size, args.usetex)
     geo = panel_geometry(args.fig_width, n_cols=PANELS_PER_ROW)
-    ci_label = r"90\% CI" if args.usetex else "90% CI"
     ests = sorted(example)
     rows = [ests[i:i + PANELS_PER_ROW] for i in range(0, len(ests), PANELS_PER_ROW)]
     z0 = example[ests[0]][0]
@@ -207,7 +214,8 @@ def run_plot(args) -> None:
         paths = _save_row_plot(
             plt, z0["x_eval"][:, 0], true_q, posterior_q, [(e, example[e][1]) for e in row],
             cache.folder / f"rows_n{args.plot_n}_row{k}", geo, legend=(k == len(rows)),
-            ylim=(y_min - pad, y_max + pad), target_name="median", ci_label=ci_label, usetex=args.usetex,
+            ylim=(y_min - pad, y_max + pad), target_name="median", ci_label=ci_label(args.alpha, args.usetex),
+            usetex=args.usetex,
         )
         print(f"[plot] {', '.join(map(str, paths))}")
 

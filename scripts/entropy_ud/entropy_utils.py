@@ -13,18 +13,18 @@ from __future__ import annotations
 
 import numpy as np
 
-from scripts.common import n_estimators
 from uqpfn import asymptotic
 
-N_ESTIMATORS = n_estimators(64)                     # all classification experiments (thesis App. A.1.2)
+N_ESTIMATORS_THESIS = 64                            # all classification experiments (thesis App. A.1.2)
 METHODS = ("beta", "probit_recentred")
 
 
-def permuted_trajectory(x_train, y_train, x_eval, *, model, rng: np.random.Generator) -> np.ndarray:
+def permuted_trajectory(x_train, y_train, x_eval, *, model, n_estimators: int,
+                        rng: np.random.Generator) -> np.ndarray:
     """(n_train, n_eval): g_k(x*) on the expanding prefixes of the randomly permuted rows."""
     from uqpfn import tabpfn
     idx = rng.permutation(len(y_train))
-    return tabpfn.build_classifier_trajectory(x_train[idx], y_train[idx], x_eval, n_estimators=N_ESTIMATORS,
+    return tabpfn.build_classifier_trajectory(x_train[idx], y_train[idx], x_eval, n_estimators=n_estimators,
                                               model=model)
 
 

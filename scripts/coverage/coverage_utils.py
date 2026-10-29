@@ -11,18 +11,41 @@ The Poisson DGP is only used by poisson_probit.py and lives there.
 """
 from __future__ import annotations
 
+import argparse
+
 import numpy as np
 from scipy.stats import norm
 from sklearn.preprocessing import SplineTransformer
 
-# spline DGP (thesis App. A.1.1)
-SPLINE_SIGMA = 0.45                     # noise sd
-SPLINE_TAU = 1.1                        # prior sd of the coefficients
-SPLINE_N_BASIS = 20
-SPLINE_DEGREE = 3
-SPLINE_Y_GRID = 241                     # response grid size
+# spline DGP (thesis App. A.1.1): defaults of the --spline-* arguments
+SPLINE_DEFAULTS = {
+    "sigma": 0.45,                      # noise sd
+    "tau": 1.1,                         # prior sd of the coefficients
+    "n_basis": 20,
+    "degree": 3,
+    "y_grid_size": 241,                 # response grid size
+}
+# fixed by the design of the experiments (cached arrays and the unbalanced design are built around them)
 TARGETS = {"median": 0.5, "q90": 0.9}   # quantile level q of y | x
 GAP = (-1.0, 1.0)                       # sparsely sampled x-region of the unbalanced design
+
+
+def add_spline_args(parser: argparse.ArgumentParser) -> None:
+    """--spline-sigma, --spline-tau, --spline-n-basis, --spline-degree, --spline-y-grid-size."""
+    d = SPLINE_DEFAULTS
+    parser.add_argument("--spline-sigma", type=float, default=d["sigma"], help="noise sd (default: %(default)s)")
+    parser.add_argument("--spline-tau", type=float, default=d["tau"],
+                        help="prior sd of the spline coefficients (default: %(default)s)")
+    parser.add_argument("--spline-n-basis", type=int, default=d["n_basis"],
+                        help="number of B-spline basis functions (default: %(default)s)")
+    parser.add_argument("--spline-degree", type=int, default=d["degree"], help="B-spline degree (default: %(default)s)")
+    parser.add_argument("--spline-y-grid-size", type=int, default=d["y_grid_size"],
+                        help="size of the response grid (default: %(default)s)")
+
+
+def spline_settings(args: argparse.Namespace) -> dict:
+    """The spline DGP settings of a run, as keyword arguments of make_spline_data (and for the cache config)."""
+    return {k: getattr(args, f"spline_{k}") for k in SPLINE_DEFAULTS}
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +147,22 @@ def analytic_ci(
     return center - half, center + half
 
 
-def make_spline_data(*, mode: str, seed: int, n_train: int, n_eval: int = 100) -> dict:
+def make_spline_data(
+    *,
+    mode: str,
+    seed: int,
+    n_train: int,
+    n_eval: int = 100,
+    sigma: float = SPLINE_DEFAULTS["sigma"],
+    tau: float = SPLINE_DEFAULTS["tau"],
+    n_basis: int = SPLINE_DEFAULTS["n_basis"],
+    degree: int = SPLINE_DEFAULTS["degree"],
+    y_grid_size: int = SPLINE_DEFAULTS["y_grid_size"],
+) -> dict:
     """
     One dataset of the spline DGP. mode 'unbalanced': 60% / 10% / 30% of the points left of, in and right
     of the gap [-1, 1]; 'balanced': x ~ U(-2.5, 2.5).
     """
-    sigma, tau = SPLINE_SIGMA, SPLINE_TAU
     rng = np.random.default_rng(seed)
 
     if mode == "balanced":
@@ -149,7 +182,7 @@ def make_spline_data(*, mode: str, seed: int, n_train: int, n_eval: int = 100) -
 
     # theta ~ N(0, tau^2 I), intercept included: exactly the prior of gaussian_posterior, so the analytic
     # posterior is the Bayes-optimal posterior of the DGP
-    z_tr, z_ev = build_design(x_train, x_eval, n_basis=SPLINE_N_BASIS, degree=SPLINE_DEGREE)
+    z_tr, z_ev = build_design(x_train, x_eval, n_basis=n_basis, degree=degree)
     theta_true = tau * rng.standard_normal(z_tr.shape[1])
     f_train = z_tr @ theta_true
     f_eval = z_ev @ theta_true
@@ -157,7 +190,7 @@ def make_spline_data(*, mode: str, seed: int, n_train: int, n_eval: int = 100) -
     mu_train, sigma_train = gaussian_posterior(z_tr, y_train, sigma=sigma, tau=tau)
 
     y_pad = 4.0 * sigma
-    y_grid = np.linspace(y_train.min() - y_pad, y_train.max() + y_pad, SPLINE_Y_GRID)
+    y_grid = np.linspace(y_train.min() - y_pad, y_train.max() + y_pad, y_grid_size)
 
     out = {
         "x_train": x_train,

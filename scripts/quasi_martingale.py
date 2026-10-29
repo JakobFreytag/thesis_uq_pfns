@@ -32,19 +32,13 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
-from scripts.common import RunCache, n_estimators, quiet_warnings, set_threads  # noqa: E402
+from scripts.common import RunCache, add_n_estimators_arg, add_seed_arg, quiet_warnings, set_threads  # noqa: E402
 
 quiet_warnings()
 os.environ["TABPFN_ALLOW_CPU_LARGE_DATASET"] = "true"
 
-SEED = 123
-N_ESTIMATORS = n_estimators(64)
-N0 = 25                             # initial prefix
-TOTAL_N = 1025                      # length of each rollout
-GRID_SIZE = 125                     # geometrically spaced evaluation points on [n0 + 100, N]
+# the support of x is fixed: the CSV columns (counts, g and drift per support point) are built around it
 SUPPORT = np.array([-1, 0, 1, 2])
-QUERY_X = 1
-DEVICE = "cpu"
 FIELDNAMES = [
     'rollout_id', 'step_n', 'query_x',
     'prefix_y_ratio', 'prefix_count_x_minus1', 'prefix_count_x_0', 'prefix_count_x_1', 'prefix_count_x_2',
@@ -61,6 +55,18 @@ def parse_args() -> argparse.Namespace:
                         help="delete the rollout CSVs and config.json in --outdir before running")
     parser.add_argument("--threads", type=int, default=8, help="torch CPU threads used by TabPFN")
     parser.add_argument("--outdir", type=Path, default=Path("results") / "tabpfn_diagnostics_rollouts")
+    add_seed_arg(parser, 123)
+    add_n_estimators_arg(parser, 64)
+    parser.add_argument("--n0", type=int, default=25, help="initial prefix n0 (default: %(default)s)")
+    parser.add_argument("--total-n", type=int, default=1025, help="length N of each rollout (default: %(default)s)")
+    parser.add_argument("--grid-size", type=int, default=125,
+                        help="geometrically spaced evaluation points on [n0 + eval-offset, N] (default: %(default)s)")
+    parser.add_argument("--eval-offset", type=int, default=100,
+                        help="first evaluation point is n0 + this (default: %(default)s)")
+    parser.add_argument("--query-x", type=float, default=1, help="test point x* (default: %(default)s)")
+    parser.add_argument("--beta", type=float, default=2.0, help="slope of the prefix logit (default: %(default)s)")
+    parser.add_argument("--beta0", type=float, default=-0.5, help="intercept of the prefix logit (default: %(default)s)")
+    parser.add_argument("--device", default="cpu", help="torch device of TabPFN (default: %(default)s)")
     return parser.parse_args()
 
 
@@ -112,7 +118,7 @@ def generate_tabpfn_rollout(total_N, n_estimators=8, n_0=25, beta=2.0, beta0=-0.
 
 
 def compute_and_log_expected_drift(X_seq, y_seq, eval_points, rollout_id, csv_filename, n_estimators=8,
-                                   query_x=QUERY_X, support=SUPPORT, device="cpu"):
+                                   query_x=1, support=SUPPORT, device="cpu"):
     """
     Computes expected drift, variance, and context state, writing every evaluation step to the CSV.
     """
@@ -223,26 +229,29 @@ def main() -> None:
     args = parse_args()
     set_threads(args.threads)
     # the CSVs are the cache here; config.json guards against mixing settings in one folder
-    cache = RunCache(args.outdir, {"n_estimators": N_ESTIMATORS, "total_n": TOTAL_N, "grid_size": GRID_SIZE,
-                                   "seed": SEED}, version=None)
+    config = {"n_estimators": args.n_estimators, "total_n": args.total_n, "grid_size": args.grid_size,
+              "seed": args.seed, "n0": args.n0, "eval_offset": args.eval_offset, "query_x": args.query_x,
+              "beta": args.beta, "beta0": args.beta0}
+    cache = RunCache(args.outdir, config, version=None)
     if args.overwrite:
         for f in args.outdir.glob("tabpfn_drift_diagnostics_raw_r*.csv"):
             f.unlink()
     cache.prepare(args.overwrite)
 
-    eval_points = np.unique(np.geomspace(N0 + 100, TOTAL_N, num=GRID_SIZE, dtype=int))
+    eval_points = np.unique(np.geomspace(args.n0 + args.eval_offset, args.total_n, num=args.grid_size, dtype=int))
     todo = [r for r in range(1, args.n_rollouts + 1) if not rollout_path(args.outdir, r).exists()]
     print(f"{len(todo)} of {args.n_rollouts} rollouts to do in {args.outdir}")
 
     for r in todo:
         print(f"=== rollout {r} of {args.n_rollouts} ===")
-        np.random.seed(SEED + r - 1)
-        X_seq, y_seq = generate_tabpfn_rollout(total_N=TOTAL_N, n_estimators=N_ESTIMATORS, n_0=N0, device=DEVICE)
+        np.random.seed(args.seed + r - 1)
+        X_seq, y_seq = generate_tabpfn_rollout(total_N=args.total_n, n_estimators=args.n_estimators, n_0=args.n0,
+                                               beta=args.beta, beta0=args.beta0, device=args.device)
         path = rollout_path(args.outdir, r)
         tmp = path.with_suffix(".csv.tmp")
         tmp.unlink(missing_ok=True)
-        compute_and_log_expected_drift(X_seq, y_seq, eval_points=eval_points, rollout_id=r,
-                                       csv_filename=str(tmp), n_estimators=N_ESTIMATORS, device=DEVICE)
+        compute_and_log_expected_drift(X_seq, y_seq, eval_points=eval_points, rollout_id=r, csv_filename=str(tmp),
+                                       n_estimators=args.n_estimators, query_x=args.query_x, device=args.device)
         os.replace(tmp, path)   # only complete rollouts count as done
         print(f"[rollout {r}] {path}")
 

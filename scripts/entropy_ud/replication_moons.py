@@ -26,17 +26,18 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
-from scripts.common import RunCache, add_run_args, quiet_warnings, seed_all, set_threads  # noqa: E402
-from scripts.entropy_ud.entropy_utils import METHODS, N_ESTIMATORS, decompose, gn_vn, permuted_trajectory  # noqa: E402,E501
+from scripts.common import (  # noqa: E402
+    RunCache, add_n_estimators_arg, add_run_args, add_seed_arg, quiet_warnings, seed_all, set_threads,
+)
+from scripts.entropy_ud.entropy_utils import (  # noqa: E402
+    METHODS, N_ESTIMATORS_THESIS, decompose, gn_vn, permuted_trajectory,
+)
 
 quiet_warnings()
 
-SEED = 2026
-SIZES = (30, 100)
-GRID_POINTS = 100                   # per coordinate
 CACHE_VERSION = 2
 
-# regimes and their evaluation grids (Fortini et al. 2026b, App. L.2.2)
+# regimes and their evaluation grids (Fortini et al. 2026b, App. L.2.2); the figures are built per regime
 REGIMES = {
     "moons1": {"noise": 0.1, "x1": (-1.5, 2.6), "x2": (-1.5, 2.6)},
     "moons2": {"noise": 0.4, "x1": (-3.0, 3.6), "x2": (-2.5, 3.1)},
@@ -65,6 +66,14 @@ FS_OV_LEGEND = 7
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Entropic UD on two moons (Fortini et al. Fig. 27).")
     add_run_args(parser)
+    parser.add_argument("--n-train-list", type=int, nargs="+", default=[30, 100],
+                        help="sample sizes n, one dataset each (default: %(default)s)")
+    parser.add_argument("--regimes", nargs="+", choices=list(REGIMES), default=list(REGIMES),
+                        help="noise regimes (default: %(default)s)")
+    add_seed_arg(parser, 2026)
+    parser.add_argument("--grid-points", type=int, default=100,
+                        help="evaluation grid points per coordinate (default: %(default)s)")
+    add_n_estimators_arg(parser, N_ESTIMATORS_THESIS)
     return parser.parse_args()
 
 
@@ -85,7 +94,7 @@ def _make_grid(regime: str, n_points: int) -> tuple[np.ndarray, np.ndarray, np.n
 
 
 def _cache(args) -> RunCache:
-    config = {"seed": SEED, "n_estimators": N_ESTIMATORS, "grid_points": GRID_POINTS}
+    config = {"seed": args.seed, "n_estimators": args.n_estimators, "grid_points": args.grid_points}
     return RunCache(args.outdir / "replication_moons", config, version=CACHE_VERSION)
 
 
@@ -97,18 +106,19 @@ def run_fit(args) -> None:
     from uqpfn import tabpfn
 
     set_threads(args.threads)
-    seed_all(SEED)
+    seed_all(args.seed)
     cache = _cache(args)
     cache.prepare(args.overwrite)
-    todo = [(r, n) for r in REGIMES for n in SIZES if not cache.has(_key(r, n))]
+    todo = [(r, n) for r in args.regimes for n in args.n_train_list if not cache.has(_key(r, n))]
     print(f"[fit] {len(todo)} datasets to do in {cache.folder}")
-    model = tabpfn.make_classifier(n_estimators=N_ESTIMATORS) if todo else None
+    model = tabpfn.make_classifier(n_estimators=args.n_estimators) if todo else None
     for regime, n in todo:
         t0 = time.time()
-        _, _, x_eval = _make_grid(regime, GRID_POINTS)
-        data = _make_data(regime, n, seed=SEED)
-        rng = np.random.default_rng(SEED + 7919 * n)
-        traj = permuted_trajectory(data["x_train"], data["y_train"], x_eval, model=model, rng=rng)
+        _, _, x_eval = _make_grid(regime, args.grid_points)
+        data = _make_data(regime, n, seed=args.seed)
+        rng = np.random.default_rng(args.seed + 7919 * n)
+        traj = permuted_trajectory(data["x_train"], data["y_train"], x_eval, model=model,
+                                   n_estimators=args.n_estimators, rng=rng)
         cache.save(_key(regime, n), x_train=data["x_train"], y_train=data["y_train"], traj=traj)
         print(f"[fit] {regime} n={n}: {time.time() - t0:.0f}s", flush=True)
 
@@ -209,10 +219,10 @@ def _save_regime_overview(entries: list[dict], methods: tuple[str, ...], out_pat
 def run_plot(args) -> None:
     cache = _cache(args)
     cache.require()
-    for regime in REGIMES:
-        axis1, axis2, _ = _make_grid(regime, GRID_POINTS)
+    for regime in args.regimes:
+        axis1, axis2, _ = _make_grid(regime, args.grid_points)
         entries = []
-        for n in SIZES:
+        for n in sorted(args.n_train_list):
             if not cache.has(_key(regime, n)):
                 continue
             z = cache.load(_key(regime, n))

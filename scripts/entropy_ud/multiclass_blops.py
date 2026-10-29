@@ -39,25 +39,17 @@ from scipy.special import digamma, log_softmax
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
-from scripts.common import RunCache, add_run_args, quiet_warnings, rep_key, set_threads  # noqa: E402
-from scripts.entropy_ud.entropy_utils import N_ESTIMATORS  # noqa: E402
+from scripts.common import (  # noqa: E402
+    RunCache, add_n_estimators_arg, add_run_args, add_seed_arg, quiet_warnings, rep_key, set_threads,
+)
+from scripts.entropy_ud.entropy_utils import N_ESTIMATORS_THESIS  # noqa: E402
 from uqpfn import asymptotic  # noqa: E402
 
 quiet_warnings()
 
-SEED = 2026
-A, H = 1.25, 2.0                    # centres (-A, 0), (A, 0), (0, H)
-SIGMA = 1.0                         # known within-class sd
-N_PER_CLASS = 30
-TAU, M0 = 5.0, 0.0                  # prior of each centre coordinate
-N_DRAWS = 5000                      # exact posterior draws S
-GRID_POINTS = 50                    # per axis
-TRANSECT_POINTS = 200               # along x1 = 0
-MARGIN = 3.0                        # the grid extends this many sigma beyond the true centres
-CHUNK = 500                         # grid points per benchmark batch (memory)
 CACHE_VERSION = 2
 
-K = 3
+K = 3                               # three clusters
 CLASS_COLORS = ("tab:red", "tab:green", "tab:blue")
 METHODS = ("dirichlet", "probit")
 METHOD_LABELS = {"dirichlet": "Dirichlet", "probit": "Probit (recentred)"}
@@ -69,6 +61,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dirichlet vs recentred probit U_e against an exact Bayesian "
                                                  "benchmark (three Gaussian clusters).")
     add_run_args(parser)
+    add_seed_arg(parser, 2026)
+    # DGP
+    parser.add_argument("--a", type=float, default=1.25, help="centres (-a, 0), (a, 0), (0, h) (default: %(default)s)")
+    parser.add_argument("--h", type=float, default=2.0, help="see --a (default: %(default)s)")
+    parser.add_argument("--sigma", type=float, default=1.0, help="known within-class sd (default: %(default)s)")
+    parser.add_argument("--n-per-class", type=int, default=30, help="points per class (default: %(default)s)")
+    # evaluation points
+    parser.add_argument("--grid-points", type=int, default=50, help="grid points per axis (default: %(default)s)")
+    parser.add_argument("--transect-points", type=int, default=200, help="points along x1 = 0 (default: %(default)s)")
+    parser.add_argument("--margin", type=float, default=3.0,
+                        help="the grid extends this many sigma beyond the true centres (default: %(default)s)")
+    add_n_estimators_arg(parser, N_ESTIMATORS_THESIS)
+    # benchmark, computed in the plot step
+    parser.add_argument("--tau", type=float, default=5.0, help="prior sd of each centre coordinate (default: %(default)s)")
+    parser.add_argument("--m0", type=float, default=0.0, help="prior mean of each centre coordinate (default: %(default)s)")
+    parser.add_argument("--n-draws", type=int, default=5000, help="exact posterior draws S (default: %(default)s)")
+    parser.add_argument("--chunk", type=int, default=500,
+                        help="grid points per benchmark batch, bounds the memory (default: %(default)s)")
     parser.add_argument("--font-scale", type=float, default=1.0, help="multiply every font size")
     return parser.parse_args()
 
@@ -148,16 +158,16 @@ def reference(x_eval: np.ndarray, mu: np.ndarray, sigma: float, chunk: int) -> d
 
 
 
-def design():
+def design(args):
     """Data, true centres and the evaluation points (grid and transect along x1 = 0)."""
-    centers = true_centers(A, H)
-    x, y = make_data(centers, SIGMA, [N_PER_CLASS] * K, SEED)
-    lo = centers.min(axis=0) - MARGIN * SIGMA
-    hi = centers.max(axis=0) + MARGIN * SIGMA
-    axes = (np.linspace(lo[0], hi[0], GRID_POINTS), np.linspace(lo[1], hi[1], GRID_POINTS))
+    centers = true_centers(args.a, args.h)
+    x, y = make_data(centers, args.sigma, [args.n_per_class] * K, args.seed)
+    lo = centers.min(axis=0) - args.margin * args.sigma
+    hi = centers.max(axis=0) + args.margin * args.sigma
+    axes = (np.linspace(lo[0], hi[0], args.grid_points), np.linspace(lo[1], hi[1], args.grid_points))
     aa, bb = np.meshgrid(*axes)
     x_grid = np.column_stack([aa.ravel(), bb.ravel()])
-    t = np.linspace(lo[1], hi[1], TRANSECT_POINTS)
+    t = np.linspace(lo[1], hi[1], args.transect_points)
     x_tr = np.column_stack([np.zeros_like(t), t])
     return x, y, axes, x_grid, x_tr
 
@@ -189,8 +199,9 @@ def approximate(g: np.ndarray, V: np.ndarray) -> dict:
 # Fit: the TabPFN trajectory over grid and transect
 # ---------------------------------------------------------------------------
 def _cache(args) -> RunCache:
-    config = {"a": A, "h": H, "sigma": SIGMA, "n_per_class": N_PER_CLASS, "seed": SEED, "grid_points": GRID_POINTS,
-              "transect_points": TRANSECT_POINTS, "margin": MARGIN, "n_estimators": N_ESTIMATORS}
+    config = {"a": args.a, "h": args.h, "sigma": args.sigma, "n_per_class": args.n_per_class, "seed": args.seed,
+              "grid_points": args.grid_points, "transect_points": args.transect_points, "margin": args.margin,
+              "n_estimators": args.n_estimators}
     return RunCache(args.outdir / "multiclass_blops", config, version=CACHE_VERSION)
 
 
@@ -198,19 +209,19 @@ def run_fit(args) -> None:
     set_threads(args.threads)
     cache = _cache(args)
     cache.prepare(args.overwrite)
-    x, y, _, x_grid, x_tr = design()
+    x, y, _, x_grid, x_tr = design(args)
     key = rep_key(len(y), 0)
     if cache.has(key):
         print(f"[fit] cached: {cache.path(key)}")
         return
     from uqpfn import tabpfn
     import torch
-    torch.manual_seed(SEED)
+    torch.manual_seed(args.seed)
     t0 = time.time()
-    perm = np.random.default_rng([SEED, 7]).permutation(len(y))  # data are class-ordered
-    model = tabpfn.make_classifier(n_estimators=N_ESTIMATORS)
+    perm = np.random.default_rng([args.seed, 7]).permutation(len(y))  # data are class-ordered
+    model = tabpfn.make_classifier(n_estimators=args.n_estimators)
     traj = tabpfn.build_multiclass_trajectory(x[perm], y[perm], np.vstack([x_grid, x_tr]), n_classes=K,
-                                              n_estimators=N_ESTIMATORS, model=model)
+                                              n_estimators=args.n_estimators, model=model)
     cache.save(key, trajectory=traj)
     print(f"[fit] TabPFN trajectory: {time.time() - t0:.0f}s")
 
@@ -416,14 +427,15 @@ def run_plot(args) -> None:
     FONT_SCALE = args.font_scale
     cache = _cache(args)
     traj = cache.load(cache.require()[0])["trajectory"]
-    x, y, axes, x_grid, x_tr = design()
+    x, y, axes, x_grid, x_tr = design(args)
     n, ng = len(y), len(x_grid)
 
     # benchmark from S exact posterior draws, and an independent second set for its Monte Carlo error
-    m, s = posterior(x, y, SIGMA, TAU, M0)
-    mu = draw_centers(m, s, N_DRAWS, SEED)
-    ref, ref_tr = reference(x_grid, mu, SIGMA, CHUNK), reference(x_tr, mu, SIGMA, CHUNK)
-    ue2 = reference(x_grid, draw_centers(m, s, N_DRAWS, SEED + 1), SIGMA, CHUNK)["ue"]
+    sigma, chunk = args.sigma, args.chunk
+    m, s = posterior(x, y, sigma, args.tau, args.m0)
+    mu = draw_centers(m, s, args.n_draws, args.seed)
+    ref, ref_tr = reference(x_grid, mu, sigma, chunk), reference(x_tr, mu, sigma, chunk)
+    ue2 = reference(x_grid, draw_centers(m, s, args.n_draws, args.seed + 1), sigma, chunk)["ue"]
 
     # TabPFN's g_n and V_n / n
     g_tab, v_tab = traj[-1], asymptotic.compute_vn_multiclass(traj) / n
@@ -445,7 +457,7 @@ def run_plot(args) -> None:
     vmax = ue_vmax(grid)                    # shared by both U_e figures
     out = cache.folder
     plot_ue_overview(grid, axes, data, "", "exact input", vmax, out / "ue_exact.png")
-    plot_transect(transect, H, out / "transect.png")
+    plot_transect(transect, args.h, out / "transect.png")
     plot_sign_check(grid, axes, data, out / "sign_check.png")
     plot_ue_overview(grid, axes, data, TAB, "TabPFN input", vmax, out / "ue_tabpfn.png")
     print(f"[plot] {out}: ue_exact.png, transect.png, sign_check.png, ue_tabpfn.png, summary.csv")

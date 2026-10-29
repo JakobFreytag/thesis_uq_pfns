@@ -54,6 +54,22 @@ def n_estimators(thesis_value: int) -> int:
     return int(os.environ.get("UQPFN_N_ESTIMATORS", thesis_value))
 
 
+def add_seed_arg(parser: argparse.ArgumentParser, default: int) -> None:
+    parser.add_argument("--seed", type=int, default=default, help="base random seed (default: %(default)s)")
+
+
+def add_n_estimators_arg(parser: argparse.ArgumentParser, thesis_value: int) -> None:
+    """--n-estimators, defaulting to the thesis value ($UQPFN_N_ESTIMATORS overrides the default)."""
+    parser.add_argument("--n-estimators", type=int, default=n_estimators(thesis_value),
+                        help=f"TabPFN ensemble size (thesis: {thesis_value}; default: %(default)s)")
+
+
+def ci_label(alpha: float, usetex: bool = False) -> str:
+    """Legend label of a (1 - alpha) interval, e.g. '95% CI'."""
+    pct = r"\%" if usetex else "%"
+    return f"{round(100 * (1 - alpha), 6):g}{pct} CI"
+
+
 def quiet_warnings() -> None:
     """Warnings from the sklearn functions TabPFN uses, and harmless overflow in the AMP copula."""
     warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
@@ -111,12 +127,17 @@ class RunCache:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.config_path.unlink(missing_ok=True)
             print(f"[fit] --overwrite: removed the cache in {self.folder}")
+        self.check()
+        self.config_path.write_text(json.dumps(_jsonable(self.config), indent=2))
+
+    def check(self) -> None:
+        """Exit if config.json exists and holds other settings than this run."""
         if self.config_path.exists():
             old = json.loads(self.config_path.read_text())
             if old != _jsonable(self.config):
-                raise SystemExit(f"{self.config_path} holds other settings {old}; rerun with --overwrite to "
-                                 "replace them, or use another --outdir to keep both.")
-        self.config_path.write_text(json.dumps(_jsonable(self.config), indent=2))
+                raise SystemExit(f"{self.config_path} holds other settings {old} than this run "
+                                 f"{_jsonable(self.config)}; pass the same arguments, rerun the fit with "
+                                 "--overwrite to replace them, or use another --outdir to keep both.")
 
     def path(self, key: str) -> Path:
         return self.dir / f"{key}.npz"
@@ -143,7 +164,8 @@ class RunCache:
         return [str(p.relative_to(self.dir).with_suffix("")) for p in files]
 
     def require(self) -> list[str]:
-        """All cached keys; exits if there are none."""
+        """All cached keys; exits if there are none, or if the cache was made with other settings."""
+        self.check()
         keys = self.keys()
         if not keys:
             raise SystemExit(f"No cached runs under {self.dir}; run with --run fit first.")

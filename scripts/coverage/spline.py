@@ -29,21 +29,18 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
 from scripts.common import (  # noqa: E402
-    RunCache, add_run_args, add_sample_args, add_style_args, fixed_axes_figure, n_estimators,
-    panel_geometry, parse_rep_key, quiet_warnings, rep_key, save_fig, se, seed_all, set_threads, setup_style,
+    RunCache, add_n_estimators_arg, add_run_args, add_sample_args, add_seed_arg, add_style_args, ci_label,
+    fixed_axes_figure, panel_geometry, parse_rep_key, quiet_warnings, rep_key, save_fig, se, seed_all, set_threads,
+    setup_style,
 )
 from scripts.coverage.coverage_utils import (  # noqa: E402
-    GAP, TARGETS, analytic_ci, invert_cdf, make_spline_data, median_ci_from_resamples,
+    GAP, TARGETS, add_spline_args, analytic_ci, invert_cdf, make_spline_data, median_ci_from_resamples,
+    spline_settings,
 )
 from uqpfn import asymptotic, martingale  # noqa: E402
 
 quiet_warnings()
 
-SEED = 2026
-N_EVAL = 100
-N_ESTIMATORS = n_estimators(64)
-B_DRAWS, T_STEPS = 100, 50          # AMP posterior draws and forward steps
-CI_ALPHA = 0.10                     # 90% intervals
 CACHE_VERSION = 3
 
 # method names in the plots (math mode so V_n renders properly) and in the table
@@ -58,14 +55,22 @@ def parse_args() -> argparse.Namespace:
     add_run_args(parser)
     parser.add_argument("--mode", choices=("unbalanced", "balanced"), default="unbalanced", help="design")
     add_sample_args(parser, n_list=(50, 100, 200), n_reps=20)
+    add_seed_arg(parser, 2026)
+    parser.add_argument("--n-eval", type=int, default=100, help="evaluation points on [-2.5, 2.5] (default: %(default)s)")
+    add_spline_args(parser)
+    add_n_estimators_arg(parser, 64)
+    parser.add_argument("--b-draws", type=int, default=100, help="AMP posterior draws B (default: %(default)s)")
+    parser.add_argument("--t-steps", type=int, default=50, help="AMP forward steps N (default: %(default)s)")
+    parser.add_argument("--alpha", type=float, default=0.10,
+                        help="intervals at level 1 - alpha, applied in the fit step (default: %(default)s)")
     parser.add_argument("--plot-n", type=int, default=200, help="sample size shown in the figures")
     add_style_args(parser)
     return parser.parse_args()
 
 
 def _cache(args) -> RunCache:
-    config = {"mode": args.mode, "seed": SEED, "n_eval": N_EVAL, "n_estimators": N_ESTIMATORS,
-              "b_draws": B_DRAWS, "t_steps": T_STEPS}
+    config = {"mode": args.mode, "seed": args.seed, "n_eval": args.n_eval, "n_estimators": args.n_estimators,
+              "b_draws": args.b_draws, "t_steps": args.t_steps, "alpha": args.alpha, "spline": spline_settings(args)}
     return RunCache(args.outdir / f"spline_{args.mode}", config, version=CACHE_VERSION)
 
 
@@ -73,16 +78,18 @@ def _cache(args) -> RunCache:
 # Fit
 # ---------------------------------------------------------------------------
 def _fit_one_rep(args, n: int, rep: int) -> dict:
-    current_seed = SEED + rep * 99
+    alpha = args.alpha
+    current_seed = args.seed + rep * 99
     seed_all(current_seed)
-    data = make_spline_data(mode=args.mode, seed=current_seed, n_train=n, n_eval=N_EVAL)
+    data = make_spline_data(mode=args.mode, seed=current_seed, n_train=n, n_eval=args.n_eval,
+                            **spline_settings(args))
 
     out = {k: data[k] for k in ("sigma", "x_train", "y_train", "x_eval", "y_grid")} | {"seed": current_seed}
 
     # optimal: exact posterior interval of the q-quantile
     for t, q in TARGETS.items():
         lo_an, hi_an = analytic_ci(data["z_ev"], data["mu_train"], data["sigma_train"], sigma=data["sigma"],
-                                   q=q, level=1 - CI_ALPHA)
+                                   q=q, level=1 - alpha)
         out[f"true_{t}"] = data[f"true_{t}"]
         out[f"posterior_{t}"] = data[f"posterior_{t}"]
         out[f"lo_an_{t}"] = lo_an
@@ -95,13 +102,13 @@ def _fit_one_rep(args, n: int, rep: int) -> dict:
     shuffle_idx = np.random.permutation(n_train)
     pred_trajectory = tabpfn.build_predictive_trajectory(
         data["x_train"][shuffle_idx], data["y_train"][shuffle_idx], data["x_eval"], data["y_grid"],
-        n_estimators=N_ESTIMATORS,
+        n_estimators=args.n_estimators,
     )
     final_cdf = pred_trajectory[-1]     # TabPFN's prediction on all n points, the centre of both methods
 
     # CLT V_n: pointwise CDF bounds, inverted at q (the lower bound comes from the upper CDF curve)
     vn_variance = asymptotic.compute_vn(pred_trajectory)
-    lower_cdf, upper_cdf = asymptotic.pointwise_cdf_bounds(final_cdf, vn_variance, n_train, alpha=CI_ALPHA)
+    lower_cdf, upper_cdf = asymptotic.pointwise_cdf_bounds(final_cdf, vn_variance, n_train, alpha=alpha)
     for t, q in TARGETS.items():
         out[f"fortini_lo_{t}"] = invert_cdf(data["y_grid"], upper_cdf, np.array([q]))[0]
         out[f"fortini_hi_{t}"] = invert_cdf(data["y_grid"], lower_cdf, np.array([q]))[0]
@@ -110,12 +117,12 @@ def _fit_one_rep(args, n: int, rep: int) -> dict:
     # AMP: copula updates starting from the same prediction; percentile interval of the q-quantile over the
     # draws, point estimate the q-quantile of the mixture CDF
     pfn_res = martingale.get_posterior(
-        data["y_grid"], n_train, B_DRAWS, T_STEPS, final_cdf, alpha_dimension=data["x_train"].shape[1],
+        data["y_grid"], n_train, args.b_draws, args.t_steps, final_cdf, alpha_dimension=data["x_train"].shape[1],
     )
     pfn_mean_cdf = np.stack([np.mean(entry["cdf"], axis=1) for entry in pfn_res]).T
     for t, q in TARGETS.items():
         out[f"pfn_ci_{t}"] = median_ci_from_resamples(
-            pfn_res, data["y_grid"], lo=100 * CI_ALPHA / 2, hi=100 * (1 - CI_ALPHA / 2), q=q
+            pfn_res, data["y_grid"], lo=100 * alpha / 2, hi=100 * (1 - alpha / 2), q=q
         )
         out[f"pfn_med_{t}"] = invert_cdf(data["y_grid"], pfn_mean_cdf, np.array([q]))[0]
 
@@ -200,20 +207,21 @@ def _save_methods_plot(
     return paths
 
 
-def _save_overview_plot(plt, z: dict, out_stem: Path, fig_width: float, usetex: bool,
+def _save_overview_plot(plt, z: dict, out_stem: Path, fig_width: float, usetex: bool, alpha: float,
                         show_gap: bool = True) -> list[Path]:
     """Training data, predictive spread (TabPFN vs optimal) and V_n along x for one repetition."""
     x = z["x_eval"][:, 0]
     order = np.argsort(x)
     xs = x[order]
     y_grid, final_cdf, vn = z["y_grid"], z["final_cdf"], z["vn_variance"]
-    z95, sig = norm.ppf(0.95), float(z["sigma"])
+    z95, sig = norm.ppf(0.95), float(z["sigma"])     # z95: the 5-95% predictive band
 
     # TabPFN predictive 5 / 50 / 95% quantiles
     q05, q50, q95 = invert_cdf(y_grid, final_cdf, np.array([0.05, 0.5, 0.95]))
-    # optimal posterior predictive N(q_Pi, sigma^2 + v(x)); v(x) recovered from the 90% analytic CI of f
+    # optimal posterior predictive N(q_Pi, sigma^2 + v(x)); v(x) recovered from the cached (1 - alpha) analytic
+    # CI of f
     q_pi = z["posterior_median"]
-    sd_f = (z["hi_an_median"] - z["lo_an_median"]) / (2 * z95)
+    sd_f = (z["hi_an_median"] - z["lo_an_median"]) / (2 * norm.ppf(1 - alpha / 2))
     sd_pred = np.sqrt(sig**2 + sd_f**2)
     # V_n at the threshold where the predictive CDF is closest to 0.5
     idx_med = np.argmin(np.abs(final_cdf - 0.5), axis=0)
@@ -297,7 +305,8 @@ def run_plot(args) -> None:
         for (n, t, region, name), m in sorted(metrics.items(), key=lambda kv: (kv[0][0], list(TARGETS).index(kv[0][1]))):
             writer.writerow([n, t, region, name, f"{np.mean(m['cov']):.6f}", f"{se(m['cov']):.6f}",
                              f"{np.mean(m['len']):.6f}", len(m["cov"])])
-    print(f"Spline DGP ({args.mode}), 90% intervals: coverage / width over all, gap, outside")
+    print(f"Spline DGP ({args.mode}), {ci_label(args.alpha).removesuffix(' CI')} intervals: coverage / width "
+          "over all, gap, outside")
     for n in sorted({k[0] for k in metrics}):
         for t in TARGETS:
             print(f"n={n}, {t} ({len(metrics[(n, t, 'all', 'AMP')]['cov'])} reps)")
@@ -312,13 +321,12 @@ def run_plot(args) -> None:
         return
     plt = setup_style(args.font_size, args.usetex)
     geo = panel_geometry(args.fig_width, n_cols=3)
-    ci_label = r"90\% CI" if args.usetex else "90% CI"
     x = example["x_eval"][:, 0]
     paths = _save_methods_plot(plt, x, example["true_median"], example["posterior_median"],
                                _methods_from_cache(example, "median"), cache.folder / f"methods_n{args.plot_n}",
-                               geo, ci_label)
+                               geo, ci_label(args.alpha, args.usetex))
     paths += _save_overview_plot(plt, example, cache.folder / f"overview_n{args.plot_n}", args.fig_width,
-                                 args.usetex, show_gap=args.mode == "unbalanced")
+                                 args.usetex, args.alpha, show_gap=args.mode == "unbalanced")
     print(f"[plot] {', '.join(map(str, paths))}")
 
 

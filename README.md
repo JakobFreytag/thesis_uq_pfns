@@ -65,14 +65,14 @@ relative to the working directory. Every script has `--help`.
 ## Thesis ↔ code
 
 Each script writes the tables and figures of its thesis section to `results/artifacts/<script>/` (spline:
-`spline_<mode>/`); the settings of the thesis are fixed in the scripts.
+`spline_<mode>/`). The settings of the thesis are the defaults of the scripts' arguments (see `--help`).
 
 | Thesis | Script | Outputs |
 |---|---|---|
 | Sec. 4.1, App. A.2, A.4, A.5 — quasi-martingale diagnostics | `quasi_martingale.py` (rollouts), then `tabpfn_diagnostics.ipynb` (figures) | rollouts in `results/tabpfn_diagnostics_rollouts/`, figures in `tabpfn_diagnostics/` |
 | Sec. 4.3: Tab. 4.1, Fig. 4.5 — $V_n$ vs `n_estimators`, linear DGP | `coverage/n_estimators_linear.py` | `coverage.csv`, `rows_n200_row*` |
 | Sec. 4.3: Tab. 4.1, App. A.6: Fig. A.5 — same, balanced spline DGP | `coverage/n_estimators_spline.py` | `coverage.csv`, `rows_n200_row*` |
-| Sec. 4.4.1: Tab. 4.2, Fig. 4.6, App. A.7: Fig. A.6 — AMP vs CLT, linear and dependent DGP | `coverage/linear_dependent.py` | `coverage.csv`, `linear_n200`, `dependent_n200_detail` |
+| Sec. 4.4.1: Tab. 4.2, Fig. 4.6, App. A.7: Fig. A.6 — AMP vs CLT, linear and dependent DGP | `coverage/linear_dependent.py` | `coverage.csv`, `linear_n200`, `dependent_n200` |
 | Sec. 4.4.2: Tab. 4.3, Fig. 4.7, 4.8, App. A.7: Tab. A.1 — AMP vs CLT vs optimal, unbalanced spline DGP | `coverage/spline.py` | `coverage.csv`, `methods_n200`, `overview_n200` |
 | App. A.7: Tab. A.2 — same, balanced design | `coverage/spline.py --mode balanced` | `coverage.csv` |
 | Sec. 4.4.3: Tab. 4.4, 4.5, App. A.7: Tab. A.3–A.5 — CLT vs probit CLT, Poisson DGP | `coverage/poisson_probit.py` | `coverage.csv`, `paired.csv` |
@@ -93,15 +93,15 @@ To reproduce everything:
 ```bash
 ./reproduce.sh          # fit what is not cached yet, then write all tables and figures (takes long)
 ./reproduce.sh plot     # only rebuild the tables and figures from the existing caches
-./reproduce.sh quick    # test run of the whole pipeline with n_estimators = 1, into results/artifacts/quick/
+./reproduce.sh quick    # test run with n_estimators = 1 and one repetition, into results/artifacts/quick/
 ```
 
 The quasi-martingale diagnostics are not part of `reproduce.sh`: the rollouts are committed, the figures come
 from `tabpfn_diagnostics.ipynb`, and recomputing the rollouts with `scripts/quasi_martingale.py` is by far the
 most expensive step.
 
-The ensemble size can also be set for a single script with `UQPFN_N_ESTIMATORS=1 python scripts/...`
-(use a separate `--outdir`).
+The ensemble size of a script is set with `--n-estimators` (`--n-estimators-list` in the `n_estimators_*`
+scripts); `UQPFN_N_ESTIMATORS=1` changes the default of all scripts at once, as `./reproduce.sh quick` does.
 
 All scripts are run from the repository root and work the same way. The TabPFN fits are the expensive
 part, so each script separates *fit* from *plot* (implemented once, in `scripts/common.py`):
@@ -109,6 +109,7 @@ part, so each script separates *fit* from *plot* (implemented once, in `scripts/
 ```
 results/artifacts/<script>/
   config.json               the settings of the fit; a cache made with other settings is refused
+                            (by the fit and by the plot step)
   cache/n0200/rep000.npz    one file per unit of work, usually one (sample size, repetition),
                             written atomically, so an interrupted run never leaves a broken file
   *.csv, *.pdf, *.png       the thesis tables and figures, rebuilt from the whole cache
@@ -121,6 +122,11 @@ results/artifacts/<script>/
 - `--threads` sets the torch CPU threads, `--outdir` the parent folder (default `results/artifacts`).
 - Scripts with repetitions also take `--n-train-list` and `--n-reps`, the regression scripts `--plot-n` (sample size of
   the figures).
+- Every experiment setting is an argument with the thesis value as default: `--seed`, `--n-estimators`, grid sizes,
+  interval level `--alpha`, AMP `--b-draws` / `--t-steps`, the DGP parameters, ... (`--help` lists them per script).
+  Settings that change the fitted results are recorded in `config.json`, so a run with other values needs its own
+  `--outdir` (or `--overwrite`); settings used only by the plot step (e.g. `--alpha` in most scripts) can be changed
+  with `--run plot` on an existing cache.
 
 ```bash
 python scripts/coverage/spline.py               # fit n = 50, 100, 200 with R = 20, then tables and figures

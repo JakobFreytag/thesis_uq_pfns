@@ -34,23 +34,29 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
-from scripts.common import RunCache, add_run_args, quiet_warnings, rep_key, set_threads  # noqa: E402
-from scripts.entropy_ud.entropy_utils import N_ESTIMATORS  # noqa: E402
+from scripts.common import (  # noqa: E402
+    RunCache, add_n_estimators_arg, add_run_args, add_seed_arg, quiet_warnings, rep_key, set_threads,
+)
+from scripts.entropy_ud.entropy_utils import N_ESTIMATORS_THESIS  # noqa: E402
 from uqpfn import asymptotic  # noqa: E402
 
 quiet_warnings()
 
-SEED = 0
-N_TRAIN = 200
-GRID_SIZE = 100
-K = 3
-G_MIN = 0.01        # below this g_k the ratio r_k is unstable -> NaN
+K = 3               # three spiral arms
 CACHE_VERSION = 2
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dirichlet vs recentred probit on three-class spirals.")
     add_run_args(parser)
+    add_seed_arg(parser, 0)
+    parser.add_argument("--n-train", type=int, default=200, help="sample size n (default: %(default)s)")
+    parser.add_argument("--noise", type=float, default=0.1, help="sd of the noise on the arms (default: %(default)s)")
+    parser.add_argument("--grid-size", type=int, default=100,
+                        help="evaluation grid points per coordinate on [-4, 4] (default: %(default)s)")
+    add_n_estimators_arg(parser, N_ESTIMATORS_THESIS)
+    parser.add_argument("--g-min", type=float, default=0.01,
+                        help="classes with g_k below this get no ratio r_k in Fig. 4.13 (default: %(default)s)")
     parser.add_argument("--font-scale", type=float, default=1.0, help="multiply every font size")
     return parser.parse_args()
 
@@ -79,7 +85,8 @@ def make_grid(size: int = 100, lo: float = -4.0, hi: float = 4.0):
 
 
 def _cache(args) -> RunCache:
-    config = {"n_train": N_TRAIN, "grid_size": GRID_SIZE, "n_estimators": N_ESTIMATORS, "seed": SEED}
+    config = {"n_train": args.n_train, "grid_size": args.grid_size, "n_estimators": args.n_estimators,
+              "seed": args.seed, "noise": args.noise}
     return RunCache(args.outdir / "replication_spirals", config, version=CACHE_VERSION)
 
 
@@ -87,14 +94,15 @@ def run_fit(args) -> None:
     set_threads(args.threads)
     cache = _cache(args)
     cache.prepare(args.overwrite)
-    key = rep_key(N_TRAIN, 0)
+    key = rep_key(args.n_train, 0)
     if cache.has(key):
         print(f"[fit] cached: {cache.path(key)}")
         return
     from uqpfn import tabpfn
-    X, y = make_spirals(n=N_TRAIN, n_classes=K, seed=SEED)
-    X_eval, _ = make_grid(GRID_SIZE)
-    traj = tabpfn.build_multiclass_trajectory(X, y, X_eval, n_classes=K, n_estimators=N_ESTIMATORS, verbose=True)
+    X, y = make_spirals(n=args.n_train, n_classes=K, noise=args.noise, seed=args.seed)
+    X_eval, _ = make_grid(args.grid_size)
+    traj = tabpfn.build_multiclass_trajectory(X, y, X_eval, n_classes=K, n_estimators=args.n_estimators,
+                                              verbose=True)
     print(f"[fit] {cache.save(key, X=X, y=y, trajectory=traj)}")
 
 
@@ -116,7 +124,7 @@ def run_plot(args) -> None:
     cache = _cache(args)
     z = cache.load(cache.require()[0])
     X, y, traj = z["X"], z["y"], z["trajectory"]
-    _, axis = make_grid(GRID_SIZE)
+    _, axis = make_grid(args.grid_size)
     plt.rcParams["font.size"] = 10.0 * args.font_scale   # ticks, colorbar labels, titles
 
     g_n = traj[-1]                                   # (n_eval, K)
@@ -132,7 +140,7 @@ def run_plot(args) -> None:
     # normalised CLT variance per class, and the rarest class against the Dirichlet's common value
     with np.errstate(divide="ignore", invalid="ignore"):
         r = (v_n / n) / (g_n * (1.0 - g_n))
-    r[(g_n < G_MIN) | ~(r > 0)] = np.nan
+    r[(g_n < args.g_min) | ~(r > 0)] = np.nan
     n_valid = np.sum(~np.isnan(r), axis=1)           # points with < 2 valid classes: nothing to compare
     r_dir = 1.0 / (dir_["alpha0"] + 1.0)
     rare = np.argmin(np.where(np.isnan(r), np.inf, g_n), axis=1)

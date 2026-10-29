@@ -34,14 +34,15 @@ from scipy.special import digamma
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
-from scripts.common import RunCache, add_run_args, add_sample_args, quiet_warnings, rep_key, set_threads  # noqa: E402
-from scripts.entropy_ud.entropy_utils import N_ESTIMATORS, decompose as decompose_tabpfn, gn_vn  # noqa: E402
+from scripts.common import (  # noqa: E402
+    RunCache, add_n_estimators_arg, add_run_args, add_sample_args, add_seed_arg, quiet_warnings, rep_key,
+    set_threads,
+)
+from scripts.entropy_ud.entropy_utils import N_ESTIMATORS_THESIS, decompose as decompose_tabpfn, gn_vn  # noqa: E402
 from uqpfn import asymptotic  # noqa: E402
 
 quiet_warnings()
 
-SEED = 2026
-THETAS = (0.5, 0.9)
 CACHE_VERSION = 2
 
 TABPFN_METHODS = ("beta", "probit_recentred")
@@ -56,11 +57,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Frequency setting: TabPFN's U_e against exact Beta references.")
     add_run_args(parser)
     add_sample_args(parser, n_list=(50, 100), n_reps=10)
+    parser.add_argument("--thetas", type=float, nargs="+", default=[0.5, 0.9],
+                        help="success probabilities theta (default: %(default)s)")
+    add_seed_arg(parser, 2026)
+    add_n_estimators_arg(parser, N_ESTIMATORS_THESIS)
     return parser.parse_args()
 
 
 def _cache(args) -> RunCache:
-    return RunCache(args.outdir / "frequency", {"seed": SEED, "n_estimators": N_ESTIMATORS}, version=CACHE_VERSION)
+    return RunCache(args.outdir / "frequency", {"seed": args.seed, "n_estimators": args.n_estimators},
+                    version=CACHE_VERSION)
 
 
 def _key(theta: float, n: int, rep: int) -> str:
@@ -80,15 +86,16 @@ def run_fit(args) -> None:
     set_threads(args.threads)
     cache = _cache(args)
     cache.prepare(args.overwrite)
-    todo = [(t, n, r) for t in THETAS for n in sorted(args.n_train_list) for r in range(args.n_reps)
+    todo = [(t, n, r) for t in args.thetas for n in sorted(args.n_train_list) for r in range(args.n_reps)
             if not cache.has(_key(t, n, r))]
     print(f"[fit] {len(todo)} datasets to do in {cache.folder}")
-    model = tabpfn.make_classifier(n_estimators=N_ESTIMATORS) if todo else None
+    model = tabpfn.make_classifier(n_estimators=args.n_estimators) if todo else None
     for theta, n, rep in todo:
         t0 = time.time()
-        rng = np.random.default_rng([SEED, int(round(theta * 1000)), n, rep])
+        rng = np.random.default_rng([args.seed, int(round(theta * 1000)), n, rep])
         x, y = make_data(n, theta, rng)
-        traj = tabpfn.build_classifier_trajectory(x, y, np.zeros((1, 1)), n_estimators=N_ESTIMATORS, model=model)
+        traj = tabpfn.build_classifier_trajectory(x, y, np.zeros((1, 1)), n_estimators=args.n_estimators,
+                                                  model=model)
         cache.save(_key(theta, n, rep), traj=traj, x=x, y=y)
         print(f"[fit] theta={theta:g} n={n} rep={rep}: {time.time() - t0:.0f}s", flush=True)
 
@@ -182,7 +189,7 @@ def run_plot(args) -> None:
             rows.append({"theta": theta, "n": n, "rep": rep, "method": m, **decompose(z["traj"], z["y"], m)})
     summary = summarise(pd.DataFrame(rows))
     summary.to_csv(cache.folder / "frequency.csv", index=False)
-    print_table(summary, N_ESTIMATORS)
+    print_table(summary, args.n_estimators)
     plot_ue(summary, cache.folder / "frequency.png")
     print(f"[plot] {cache.folder / 'frequency.png'}, frequency.csv")
 

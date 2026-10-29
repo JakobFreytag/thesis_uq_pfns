@@ -39,20 +39,15 @@ from scipy.special import expit, log_expit
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
-from scripts.common import RunCache, add_run_args, add_sample_args, parse_rep_key, quiet_warnings, rep_key, seed_all, set_threads  # noqa: E402,E501
-from scripts.entropy_ud.entropy_utils import METHODS, N_ESTIMATORS, decompose, gn_vn  # noqa: E402
+from scripts.common import (  # noqa: E402
+    RunCache, add_n_estimators_arg, add_run_args, add_sample_args, add_seed_arg, parse_rep_key, quiet_warnings,
+    rep_key, seed_all, set_threads,
+)
+from scripts.entropy_ud.entropy_utils import METHODS, N_ESTIMATORS_THESIS, decompose, gn_vn  # noqa: E402
 from uqpfn import asymptotic  # noqa: E402
 
 quiet_warnings()
 
-SEED = 2026
-TAU = 2.0                           # prior sd of (b0, b1)
-GRID = (-4.0, 4.0, 0.1)             # test points x*: lo, hi, step
-THETA_GRID = 400                    # K for the K x K posterior grid over [-5 tau, 5 tau]^2
-CHECK_GRID, CHECK_REPS, GRID_TOL = 800, 3, 0.01     # benchmark accuracy check
-MIN_REF_UE = 1e-3                   # points with U_e^ref below this are left out of the relative errors
-REGION_IN, REGION_OUT = 2.0, 2.5    # |x*| <= 2: in the data, |x*| >= 2.5: extrapolation
-EXAMPLE_REPS, EXAMPLE_SIZES = (0, 1, 2), (20,)
 CACHE_VERSION = 2
 
 METHOD_LABELS = {"beta": "Beta", "probit_recentred": "Probit (recentred)"}
@@ -68,6 +63,31 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Entropic UD on Bayesian logistic regression vs the exact benchmark.")
     add_run_args(parser)
     add_sample_args(parser, n_list=(20, 50, 100), n_reps=5)
+    add_seed_arg(parser, 2026)
+    parser.add_argument("--tau", type=float, default=2.0, help="prior sd of (b0, b1) (default: %(default)s)")
+    parser.add_argument("--grid", type=float, nargs=3, default=[-4.0, 4.0, 0.1], metavar=("LO", "HI", "STEP"),
+                        help="test points x* (default: %(default)s)")
+    parser.add_argument("--theta-grid", type=int, default=400,
+                        help="K of the K x K posterior grid over [-5 tau, 5 tau]^2 (default: %(default)s)")
+    add_n_estimators_arg(parser, N_ESTIMATORS_THESIS)
+    # benchmark accuracy check in the fit step
+    parser.add_argument("--check-grid", type=int, default=800,
+                        help="finer K the benchmark is checked against (default: %(default)s)")
+    parser.add_argument("--check-reps", type=int, default=3,
+                        help="datasets on which the benchmark is checked (default: %(default)s)")
+    parser.add_argument("--grid-tol", type=float, default=0.01,
+                        help="largest allowed relative change of the benchmark on the finer grid (default: %(default)s)")
+    # relative-error table and figures in the plot step
+    parser.add_argument("--min-ref-ue", type=float, default=1e-3,
+                        help="points with U_e^ref below this are left out of the relative errors (default: %(default)s)")
+    parser.add_argument("--region-in", type=float, default=2.0,
+                        help="|x*| <= this: in the data (default: %(default)s)")
+    parser.add_argument("--region-out", type=float, default=2.5,
+                        help="|x*| >= this: extrapolation (default: %(default)s)")
+    parser.add_argument("--example-reps", type=int, nargs="+", default=[0, 1, 2],
+                        help="datasets shown in the figures (default: %(default)s)")
+    parser.add_argument("--example-sizes", type=int, nargs="+", default=[20],
+                        help="sample sizes shown in the figures (default: %(default)s)")
     return parser.parse_args()
 
 
@@ -165,27 +185,29 @@ class ReferenceGrid:
         return out
 
 
-def check_grid_accuracy(x, y, sizes, ref, x_eval, rep):
-    """Recompute the benchmark on a finer grid; fail if ref_var or ref_ue moves by more than GRID_TOL."""
-    fine = ReferenceGrid(TAU, CHECK_GRID, x_eval, tables=False)
+def check_grid_accuracy(args, x, y, sizes, ref, x_eval, rep):
+    """Recompute the benchmark on a finer grid; fail if ref_var or ref_ue moves by more than --grid-tol."""
+    fine = ReferenceGrid(args.tau, args.check_grid, x_eval, tables=False)
     ref_f = fine.moments(fine.weights(x, y, sizes))
     worst = 0.0
     for n in sizes:
         a, b = ref[n], ref_f[n]
-        mask = b["ue"] >= MIN_REF_UE        # the points that enter the relative errors
+        mask = b["ue"] >= args.min_ref_ue   # the points that enter the relative errors
         if not mask.any():
             mask = np.ones_like(mask)
         dv = np.max(np.abs(a["var"][mask] - b["var"][mask]) / b["var"][mask])
         du = np.max(np.abs(a["ue"][mask] - b["ue"][mask]) / b["ue"][mask])
         worst = max(worst, dv, du)
-        if max(dv, du) > GRID_TOL:
+        if max(dv, du) > args.grid_tol:
             raise RuntimeError(f"benchmark grid too coarse (rep {rep}, n={n}): ref_var changes by {dv:.2%}, "
-                               f"ref_ue by {du:.2%} going to K={CHECK_GRID}")
-    print(f"  grid check, rep {rep}: K {THETA_GRID} -> {CHECK_GRID} changes ref_var and ref_ue by <= {worst:.0e}")
+                               f"ref_ue by {du:.2%} going to K={args.check_grid}")
+    print(f"  grid check, rep {rep}: K {args.theta_grid} -> {args.check_grid} changes ref_var and ref_ue by "
+          f"<= {worst:.0e}")
 
 
 def _cache(args) -> RunCache:
-    config = {"seed": SEED, "tau": TAU, "grid": list(GRID), "theta_grid": THETA_GRID, "n_estimators": N_ESTIMATORS}
+    config = {"seed": args.seed, "tau": args.tau, "grid": list(args.grid), "theta_grid": args.theta_grid,
+              "n_estimators": args.n_estimators}
     return RunCache(args.outdir / "logistic_optimum", config, version=CACHE_VERSION)
 
 
@@ -194,10 +216,10 @@ def _cache(args) -> RunCache:
 # ---------------------------------------------------------------------------
 def run_fit(args) -> None:
     set_threads(args.threads)
-    seed_all(SEED)
+    seed_all(args.seed)
     cache = _cache(args)
     cache.prepare(args.overwrite)
-    x_eval = make_x_eval(*GRID)
+    x_eval = make_x_eval(*args.grid)
     sizes, n_max = sorted(args.n_train_list), max(args.n_train_list)
     todo = [rep for rep in range(args.n_reps) if not cache.has(rep_key(n_max, rep))]
     print(f"[fit] {len(todo)} datasets to do in {cache.folder}")
@@ -205,18 +227,18 @@ def run_fit(args) -> None:
         return
 
     from uqpfn import tabpfn
-    grid = ReferenceGrid(TAU, THETA_GRID, x_eval)
-    model = tabpfn.make_classifier(n_estimators=N_ESTIMATORS)
+    grid = ReferenceGrid(args.tau, args.theta_grid, x_eval)
+    model = tabpfn.make_classifier(n_estimators=args.n_estimators)
     for rep in todo:
         t0 = time.time()
-        rng = np.random.default_rng(SEED + rep)
-        x, y, beta = make_data(n_max, TAU, rng)
+        rng = np.random.default_rng(args.seed + rep)
+        x, y, beta = make_data(n_max, args.tau, rng)
         ref = grid.moments(grid.weights(x, y, sizes))
-        if rep < CHECK_REPS:
-            check_grid_accuracy(x, y, sizes, ref, x_eval, rep)
+        if rep < args.check_reps:
+            check_grid_accuracy(args, x, y, sizes, ref, x_eval, rep)
         # one trajectory on the rows in their generated order: they are i.i.d., so this order is already a
         # random permutation, and the first n rows are a trajectory for D_n
-        traj = tabpfn.build_classifier_trajectory(x, y, x_eval.reshape(-1, 1), n_estimators=N_ESTIMATORS,
+        traj = tabpfn.build_classifier_trajectory(x, y, x_eval.reshape(-1, 1), n_estimators=args.n_estimators,
                                                   model=model)
         arrays = {"x": x, "y": y, "beta": beta, "sizes": np.array(sizes), "traj": traj}
         for k in ("mean", "var", "ua", "ue"):
@@ -228,9 +250,9 @@ def run_fit(args) -> None:
 # ---------------------------------------------------------------------------
 # Plot: Tab. A.6 and Fig. 4.11 from the cache
 # ---------------------------------------------------------------------------
-def _point_frame(cache: RunCache) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _point_frame(cache: RunCache, grid) -> tuple[pd.DataFrame, pd.DataFrame]:
     """U_e of the benchmark and of both methods at every (dataset, n, x*, inputs), and the datasets."""
-    x_eval = make_x_eval(*GRID)
+    x_eval = make_x_eval(*grid)
     frames, datasets = [], []
     for key in cache.require():
         rep = parse_rep_key(key)[1]
@@ -249,11 +271,10 @@ def _point_frame(cache: RunCache) -> tuple[pd.DataFrame, pd.DataFrame]:
     return pd.concat(frames, ignore_index=True), pd.concat(datasets, ignore_index=True)
 
 
-def relative_error_table(df: pd.DataFrame) -> pd.DataFrame:
+def relative_error_table(df: pd.DataFrame, region_in: float, region_out: float, min_ref_ue: float) -> pd.DataFrame:
     """Tab. A.6: mean |U_e_hat - U_e^ref| / U_e^ref in %, per region over points, then over datasets."""
-    a = np.abs(df["x_star"])
-    df = df.assign(region=np.where(a <= REGION_IN + 1e-9, "in", np.where(a >= REGION_OUT - 1e-9, "out", "mid")))
-    df = df[(df["region"] != "mid") & (df["ref_ue"] >= MIN_REF_UE)]
+    df = df.assign(region=region_of(df["x_star"], region_in, region_out))
+    df = df[(df["region"] != "mid") & (df["ref_ue"] >= min_ref_ue)]
     df = df.assign(abs_rel_err=100 * np.abs(df["ue_hat"] - df["ref_ue"]) / df["ref_ue"])
     per_dataset = df.groupby(["evaluation", "n", "region", "method", "rep"])["abs_rel_err"].mean().unstack("method")
     rows = []
@@ -294,11 +315,11 @@ def _ue_lines(ax, sub, methods):
                 label=METHOD_LABELS[m])
 
 
-def plot_examples(df, ds, evaluation, methods, run_dir):
+def plot_examples(df, ds, evaluation, methods, run_dir, *, example_reps, example_sizes, grid):
     """A few datasets (columns) at a few n (rows), with the training x as a rug."""
     plt = _plt()
-    reps = [r for r in EXAMPLE_REPS if r in set(df["rep"])]
-    ns = [n for n in EXAMPLE_SIZES if n in set(df["n"])]
+    reps = [r for r in example_reps if r in set(df["rep"])]
+    ns = [n for n in example_sizes if n in set(df["n"])]
     e = df[df["evaluation"] == evaluation]
     fig, axes = plt.subplots(len(ns), len(reps), figsize=(FIG_W, 2.1 * len(ns) + 0.6),
                              sharex=True, sharey="row", squeeze=False)
@@ -310,7 +331,7 @@ def plot_examples(df, ds, evaluation, methods, run_dir):
             x, y = data["x"].to_numpy()[:n], data["y"].to_numpy()[:n]
             ax.plot(x[y == 0], np.zeros((y == 0).sum()), "|", color="C4", ms=8)
             ax.plot(x[y == 1], np.zeros((y == 1).sum()), "|", color="C1", ms=8)
-            ax.set_xlim(GRID[0], GRID[1])
+            ax.set_xlim(grid[0], grid[1])
             if i == 0:
                 ax.set_title(f"$\\beta_0$={data['b0'].iloc[0]:.2f}, "
                              f"$\\beta_1$={data['b1'].iloc[0]:.2f}")
@@ -326,14 +347,15 @@ def plot_examples(df, ds, evaluation, methods, run_dir):
 
 def run_plot(args) -> None:
     cache = _cache(args)
-    df, ds = _point_frame(cache)
-    table = relative_error_table(df)
+    df, ds = _point_frame(cache, args.grid)
+    table = relative_error_table(df, args.region_in, args.region_out, args.min_ref_ue)
     table.to_csv(cache.folder / "relative_error.csv", index=False, float_format="%.1f")
     print("Mean absolute relative error of U_e (%); beta_better: datasets in which the Beta has the lower error")
     print(table.to_string(index=False, float_format=lambda v: f"{v:.1f}"))
     print(f"[table] {cache.folder / 'relative_error.csv'}")
     for evaluation in INPUTS:
-        plot_examples(df, ds, evaluation, METHODS, cache.folder)
+        plot_examples(df, ds, evaluation, METHODS, cache.folder, example_reps=args.example_reps,
+                      example_sizes=args.example_sizes, grid=args.grid)
 
 
 def main() -> None:

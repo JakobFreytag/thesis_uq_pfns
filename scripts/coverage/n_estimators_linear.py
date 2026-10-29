@@ -28,19 +28,14 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [p for p in (str(ROOT), str(ROOT / "src")) if p not in sys.path]
 
 from scripts.common import (  # noqa: E402
-    RunCache, add_run_args, add_sample_args, add_style_args, fixed_axes_figure, n_estimators,
-    panel_geometry, parse_rep_key, quiet_warnings, rep_key, save_fig, se, set_threads, setup_style,
+    RunCache, add_run_args, add_sample_args, add_seed_arg, add_style_args, ci_label, fixed_axes_figure,
+    n_estimators, panel_geometry, parse_rep_key, quiet_warnings, rep_key, save_fig, se, set_threads, setup_style,
 )
 from scripts.coverage.coverage_utils import generate_linear, threshold_grid, true_prob_linear  # noqa: E402
 from uqpfn import asymptotic  # noqa: E402
 
 quiet_warnings()
 
-SEED = 42
-T_THRESH = 0.0                      # target P(Y <= t | X = x)
-Y_GRID_SIZE = 250
-N_EVAL = 100
-ALPHA = 0.05                        # 95% intervals
 PANELS_PER_ROW = 3
 LEGEND_SPACE = 0.30
 CACHE_VERSION = 2
@@ -53,7 +48,14 @@ def parse_args() -> argparse.Namespace:
     add_run_args(parser)
     add_sample_args(parser, n_list=(200,), n_reps=10)
     parser.add_argument("--n-estimators-list", type=int, nargs="+",
-                        default=sorted({n_estimators(e) for e in (4, 8, 16, 32, 64)}))
+                        default=sorted({n_estimators(e) for e in (4, 8, 16, 32, 64)}),
+                        help="TabPFN ensemble sizes (default: %(default)s)")
+    add_seed_arg(parser, 42)
+    parser.add_argument("--t-thresh", type=float, default=0.0, help="target P(Y <= t | X = x) (default: %(default)s)")
+    parser.add_argument("--y-grid-size", type=int, default=250, help="size of the response grid (default: %(default)s)")
+    parser.add_argument("--n-eval", type=int, default=100, help="evaluation points on [-10, 10] (default: %(default)s)")
+    parser.add_argument("--alpha", type=float, default=0.05,
+                        help="intervals at level 1 - alpha, applied in the plot step (default: %(default)s)")
     parser.add_argument("--plot-n", type=int, default=200, help="sample size shown in the figures")
     add_style_args(parser)
     return parser.parse_args()
@@ -106,7 +108,7 @@ def _save_row_plot(
 
 
 def _cache(args) -> RunCache:
-    config = {"seed": SEED, "t_thresh": T_THRESH, "y_grid_size": Y_GRID_SIZE, "n_eval": N_EVAL}
+    config = {"seed": args.seed, "t_thresh": args.t_thresh, "y_grid_size": args.y_grid_size, "n_eval": args.n_eval}
     return RunCache(args.outdir / "n_estimators_linear", config, version=CACHE_VERSION)
 
 
@@ -114,22 +116,22 @@ def _key(n: int, rep: int, n_est: int) -> str:
     return rep_key(n, rep, f"_est{n_est:03d}")
 
 
-def _fit_one(n_train: int, rep: int, n_est: int) -> dict:
+def _fit_one(args, n_train: int, rep: int, n_est: int) -> dict:
     """V_n trajectory on the shuffled data; the final CDF and V_n are cached."""
     from uqpfn import tabpfn
 
-    seed = SEED + rep * 1000 + n_train
+    seed = args.seed + rep * 1000 + n_train
     rng = np.random.default_rng(seed)
     X_train, y_train = generate_linear(n_train, rng)
-    X_eval = np.linspace(-10, 10, N_EVAL).reshape(-1, 1)
-    y_grid = threshold_grid(y_train, Y_GRID_SIZE, T_THRESH)
+    X_eval = np.linspace(-10, 10, args.n_eval).reshape(-1, 1)
+    y_grid = threshold_grid(y_train, args.y_grid_size, args.t_thresh)
 
     shuffle_idx = rng.permutation(n_train)          # the same permutation for every n_estimators
     pred_trajectory = tabpfn.build_predictive_trajectory(
         X_train[shuffle_idx], y_train[shuffle_idx], X_eval, y_grid, n_estimators=n_est
     )
     return {
-        "seed": seed, "n_train": n_train, "n_est": n_est, "t_thresh": T_THRESH,
+        "seed": seed, "n_train": n_train, "n_est": n_est, "t_thresh": args.t_thresh,
         "x_train": X_train, "y_train": y_train, "x_eval": X_eval, "y_grid": y_grid,
         "final_cdf": pred_trajectory[-1], "vn_variance": asymptotic.compute_vn(pred_trajectory, type="pointwise"),
     }
@@ -144,16 +146,16 @@ def run_fit(args) -> None:
     print(f"[fit] {len(todo)} runs to do in {cache.folder}")
     for i, (n, rep, e) in enumerate(todo, 1):
         t0 = time.perf_counter()
-        cache.save(_key(n, rep, e), **_fit_one(n, rep, e))
+        cache.save(_key(n, rep, e), **_fit_one(args, n, rep, e))
         print(f"[fit {i}/{len(todo)}] n={n} rep={rep} n_estimators={e}: {time.perf_counter() - t0:.0f}s", flush=True)
 
 
-def _intervals(z: dict) -> dict:
+def _intervals(z: dict, t_thresh: float, alpha: float) -> dict:
     """CLT V_n interval for P(Y <= t | x) from the cached final CDF and V_n."""
-    idx = int(np.argmin(np.abs(z["y_grid"] - T_THRESH)))
+    idx = int(np.argmin(np.abs(z["y_grid"] - t_thresh)))
     pred = z["final_cdf"][idx]
-    lo, hi = asymptotic.pointwise_cdf_bounds(pred, z["vn_variance"][idx], int(z["n_train"]), alpha=ALPHA)
-    truth = true_prob_linear(z["x_eval"], T_THRESH)
+    lo, hi = asymptotic.pointwise_cdf_bounds(pred, z["vn_variance"][idx], int(z["n_train"]), alpha=alpha)
+    truth = true_prob_linear(z["x_eval"], t_thresh)
     return {"lo": lo, "med": pred, "hi": hi, "cov": (truth >= lo) & (truth <= hi), "len": hi - lo}
 
 
@@ -164,7 +166,7 @@ def run_plot(args) -> None:
         n, rep, est_s = parse_rep_key(key)
         n_est = int(est_s[4:])
         z = cache.load(key)
-        e = _intervals(z)
+        e = _intervals(z, args.t_thresh, args.alpha)
         acc = metrics.setdefault((n, n_est), {"cov": [], "len": []})
         acc["cov"].append(float(np.mean(e["cov"])))
         acc["len"].append(float(np.mean(e["len"])))
@@ -172,7 +174,8 @@ def run_plot(args) -> None:
             example[n_est] = (z, e)
 
     path = cache.folder / "coverage.csv"
-    print(f"Linear DGP, CLT V_n, 95% intervals for P(Y <= {T_THRESH:g} | x)")
+    print(f"Linear DGP, CLT V_n, {ci_label(args.alpha).removesuffix(' CI')} intervals for "
+          f"P(Y <= {args.t_thresh:g} | x)")
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["n", "n_estimators", "coverage", "se_coverage", "width", "n_reps"])
@@ -188,16 +191,15 @@ def run_plot(args) -> None:
         return
     plt = setup_style(args.font_size, args.usetex)
     geo = panel_geometry(args.fig_width, n_cols=PANELS_PER_ROW)
-    ci_label = r"95\% CI" if args.usetex else "95% CI"
     ests = sorted(example)
     rows = [ests[i:i + PANELS_PER_ROW] for i in range(0, len(ests), PANELS_PER_ROW)]
     z0 = example[ests[0]][0]
-    truth = true_prob_linear(z0["x_eval"], T_THRESH)
+    truth = true_prob_linear(z0["x_eval"], args.t_thresh)
     for k, row in enumerate(rows, 1):
         paths = _save_row_plot(
             plt, z0["x_eval"][:, 0], truth, [(e, example[e][1]) for e in row],
-            cache.folder / f"rows_n{args.plot_n}_row{k}", geo,
-            legend=(k == len(rows)), t_thresh=T_THRESH, ci_label=ci_label, usetex=args.usetex,
+            cache.folder / f"rows_n{args.plot_n}_row{k}", geo, legend=(k == len(rows)), t_thresh=args.t_thresh,
+            ci_label=ci_label(args.alpha, args.usetex), usetex=args.usetex,
         )
         print(f"[plot] {', '.join(map(str, paths))}")
 
